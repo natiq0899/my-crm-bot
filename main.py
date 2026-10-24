@@ -159,7 +159,59 @@ async def menu_summary(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "menu_subs")
 async def menu_subs(callback: types.CallbackQuery):
-    await callback.message.edit_text("Раздел подписок в разработке для этой версии.", reply_markup=back_to_menu())
+    subs = db_query("SELECT id, client, end_date FROM subs", fetch=True)
+    text = "💳 <b>Подписки (490 ₽/мес)</b>\n\n"
+    if not subs:
+        text += "Пока нет активных подписок."
+    else:
+        for sub_id, client, end_date in subs:
+            text += f"• {client} — до {end_date}\n"
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Новая подписка", callback_data="add_sub")
+    kb.button(text="✅ Отметить оплату", callback_data="pay_sub_list")
+    kb.button(text="◀️ Меню", callback_data="menu_main")
+    kb.adjust(1)
+    await callback.message.edit_text(text, reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data == "add_sub")
+async def add_sub_start(callback: types.CallbackQuery):
+    user_states[callback.from_user.id] = "wait_sub"
+    await callback.message.edit_text("Отправь одним сообщением:\n<b>Название клиента | Дата окончания (ДД.ММ.ГГГГ)</b>\n\n<i>Пример: Кофейня Ромашка | 25.12.2026</i>", reply_markup=back_to_menu())
+
+@dp.callback_query(F.data == "pay_sub_list")
+async def pay_sub_list(callback: types.CallbackQuery):
+    subs = db_query("SELECT id, client FROM subs", fetch=True)
+    if not subs:
+        await callback.message.edit_text("Нет подписок для оплаты.", reply_markup=back_to_menu())
+        return
+    
+    kb = InlineKeyboardBuilder()
+    for sub_id, client in subs:
+        kb.button(text=f"💳 {client}", callback_data=f"pay_sub_{sub_id}")
+    kb.button(text="◀️ Назад", callback_data="menu_subs")
+    kb.adjust(1)
+    await callback.message.edit_text("Выбери подписку для оплаты (добавится 490 ₽ и +1 месяц):", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("pay_sub_"))
+async def pay_sub_process(callback: types.CallbackQuery):
+    sub_id = int(callback.data.split("_")[2])
+    sub = db_query("SELECT client, end_date FROM subs WHERE id=?", (sub_id,), fetch=True)[0]
+    client_name = sub[0]
+    
+    # Продлеваем на 30 дней от текущей даты окончания
+    try:
+        old_date = datetime.strptime(sub[1], "%d.%m.%Y")
+    except:
+        old_date = datetime.now()
+    
+    new_date = old_date + timedelta(days=30)
+    new_date_str = new_date.strftime("%d.%m.%Y")
+    
+    db_query("UPDATE subs SET end_date=? WHERE id=?", (new_date_str, sub_id))
+    db_query("INSERT INTO money (comment, type, amount) VALUES (?, ?, ?)", (f"Подписка: {client_name}", "Поступление", 490))
+    
+    await callback.message.edit_text(f"✅ Подписка для <b>{client_name}</b> продлена до {new_date_str}.\nВ Деньги добавлено 490 ₽.", reply_markup=back_to_menu())
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
@@ -182,6 +234,17 @@ async def handle_text(message: types.Message):
         db_query("INSERT INTO orders (client, amount, desc, status) VALUES (?, ?, ?, 'В работе')", (parts[0], amount, desc))
         user_states.pop(message.from_user.id, None)
         await message.answer("✅ Заказ добавлен.", reply_markup=main_menu())
+    elif state == "wait_sub":
+        if len(parts) < 2: return await message.answer("❌ Формат: Клиент | Дата (ДД.ММ.ГГГГ)")
+        client_name = parts[0]
+        date_str = parts[1]
+        try:
+            datetime.strptime(date_str, "%d.%m.%Y")
+        except ValueError:
+            return await message.answer("❌ Неверный формат даты. Нужно ДД.ММ.ГГГГ (например, 25.12.2026)")
+        db_query("INSERT INTO subs (client, end_date) VALUES (?, ?)", (client_name, date_str))
+        user_states.pop(message.from_user.id, None)
+        await message.answer("✅ Подписка добавлена.", reply_markup=main_menu())
     elif state == "wait_money":
         if len(parts) < 2: return await message.answer("❌ Формат: Тип | Сумма | Комментарий")
         if parts[0] not in ["Поступление", "Расход"]: return await message.answer("❌ Тип: 'Поступление' или 'Расход'")
